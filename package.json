@@ -1,0 +1,19 @@
+{
+  "name": "fastify-k8s-tutorial",
+  "version": "1.0.0",
+  "description": "Fastify CRUD API for Kubernetes tutorial",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": ["fastify", "kubernetes", "k8s", "crud", "api"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "fastify": "^4.25.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

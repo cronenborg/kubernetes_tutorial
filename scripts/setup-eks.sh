@@ -1,0 +1,153 @@
+name: Deploy to EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - production
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Check and setup EKS cluster
+      id: setup-eks
+      run: |
+        # Check if cluster exists
+        if aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "Cluster exists"
+          echo "cluster_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Cluster does not exist"
+          echo "cluster_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Install eksctl
+      if: steps.setup-eks.outputs.cluster_exists == 'false'
+      run: |
+        ARCH=amd64
+        PLATFORM=$(uname -s)_$ARCH
+        curl -sLO "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
+        tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp && rm eksctl_$PLATFORM.tar.gz
+        sudo mv /tmp/eksctl /usr/local/bin
+
+    - name: Create EKS cluster
+      if: steps.setup-eks.outputs.cluster_exists == 'false'
+      run: |
+        echo "Creating EKS cluster ${{ env.EKS_CLUSTER_NAME }}..."
+        eksctl create cluster \
+          --name ${{ env.EKS_CLUSTER_NAME }} \
+          --region ${{ env.AWS_REGION }} \
+          --nodegroup-name standard-workers \
+          --node-type t3.medium \
+          --nodes 2 \
+          --nodes-min 1 \
+          --nodes-max 4 \
+          --managed \
+          --with-oidc
+        echo "Cluster created successfully"
+
+    - name: Create ECR repository if not exists
+      run: |
+        aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+        aws ecr create-repository \
+          --repository-name ${{ env.ECR_REPOSITORY }} \
+          --region ${{ env.AWS_REGION }} \
+          --image-scanning-configuration scanOnPush=true \
+          --encryption-configuration encryptionType=AES256
+
+    - name: Update kube config
+      run: |
+        aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Create namespace if not exists
+      run: |
+        NAMESPACE=${K8S_NAMESPACE:-default}
+        if [ "$NAMESPACE" != "default" ]; then
+          kubectl get namespace $NAMESPACE 2>/dev/null || kubectl create namespace $NAMESPACE
+        fi
+
+    - name: Get ECR image URI
+      id: image
+      run: |
+        IMAGE_TAG=${GITHUB_SHA::7}
+        IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+        echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Update deployment image
+      run: |
+        # Update the image in deployment file
+        sed -i "s|<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/fastify-crud-api:latest|${{ steps.image.outputs.uri }}|g" k8s/eks/deployment.yaml
+
+    - name: Deploy to EKS
+      run: |
+        kubectl apply -f k8s/eks/deployment.yaml
+        kubectl apply -f k8s/eks/service.yaml
+
+    - name: Wait for deployment to be ready
+      run: |
+        kubectl rollout status deployment/fastify-crud-api --timeout=5m
+
+    - name: Verify deployment
+      run: |
+        kubectl get pods -l app=fastify-crud-api
+        kubectl get service fastify-crud-api
+
+    - name: Get LoadBalancer URL
+      id: lb-url
+      run: |
+        echo "Waiting for LoadBalancer to be ready..."
+        sleep 30
+        LB_URL=$(kubectl get service fastify-crud-api -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        echo "url=$LB_URL" >> $GITHUB_OUTPUT
+        echo "LoadBalancer URL: http://$LB_URL"
+
+    - name: Comment PR with deployment info
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: '🚀 Deployed to EKS!\n\nLoadBalancer URL: http://${{ steps.lb-url.outputs.url }}'
+          })
